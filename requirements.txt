@@ -1,0 +1,7 @@
+python-telegram-bot
+langchain
+langchain-openai
+langchain-experimental
+pandas
+requests
+python-dotenv
