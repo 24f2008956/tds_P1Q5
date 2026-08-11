@@ -1,168 +1,481 @@
 import os
 import json
-import logging
+import time
 import uuid
+import logging
 import requests
+
 from dotenv import load_dotenv
+from openai import OpenAI
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.prebuilt import create_react_agent
+# ---------------------------------------------------------
+# 1. Load environment variables
+# ---------------------------------------------------------
 
-# 1. Load Environment Variables
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openai/v1")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+AIPIPE_TOKEN = os.getenv("LLM_API_KEY")
+AIPIPE_BASE_URL = os.getenv(
+    "LLM_BASE_URL",
+    "https://aipipe.org/openai/v1"
+)
+AIPIPE_MODEL = os.getenv("LLM_MODEL", "gpt-5-mini")
 GIST_TOKEN = os.getenv("GITHUB_GIST_TOKEN")
 
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+# ---------------------------------------------------------
+# 2. Logging
+# ---------------------------------------------------------
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
 logger = logging.getLogger(__name__)
 
-chat_histories = {}
+# ---------------------------------------------------------
+# 3. OpenAI-compatible AI Pipe client
+# ---------------------------------------------------------
 
-# 2. Tools for the Agent
-@tool
-def fetch_url_content(url: str) -> str:
-    try:
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        return response.text[:8000]
-    except Exception as e:
-        return f"Error fetching URL: {str(e)}"
+client = OpenAI(
+    base_url=AIPIPE_BASE_URL,
+    api_key=AIPIPE_TOKEN,
+)
 
-@tool
-def python_data_analysis(code: str) -> str:
-    try:
-        safe_globals = {"__builtins__": __builtins__, "pd": __import__("pandas"), "io": __import__("io")}
-        import io, sys
-        old_stdout = sys.stdout
-        sys.stdout = captured_output = io.StringIO()
-        exec(code, safe_globals)
-        sys.stdout = old_stdout
-        return captured_output.getvalue().strip()
-    except Exception as e:
-        return f"Execution Error: {str(e)}"
+# ---------------------------------------------------------
+# 4. Conversation history
+# ---------------------------------------------------------
 
-tools = [fetch_url_content, python_data_analysis]
+conversation_history = {}
 
-# 3. Log Uploader (GitHub Gist)
+# ---------------------------------------------------------
+# 5. Gist logging
+# ---------------------------------------------------------
+
 def upload_log_to_gist(run_id: str, log_entries: list) -> str:
-    jsonl_content = "\n".join(json.dumps(entry) for entry in log_entries)
-    url = "https://api.github.com/gists"
-    headers = {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    """
+    Upload one run's JSONL log to a public GitHub Gist.
+    """
+
+    if not GIST_TOKEN:
+        logger.error("GITHUB_GIST_TOKEN is not configured")
+        return ""
+
+    jsonl_content = "\n".join(
+        json.dumps(entry, ensure_ascii=False)
+        for entry in log_entries
+    )
+
+    filename = f"run_{run_id}.jsonl"
+
     payload = {
         "description": f"TDS Bot Run Log: {run_id}",
         "public": True,
-        "files": {f"run_{run_id}.jsonl": {"content": jsonl_content}}
+        "files": {
+            filename: {
+                "content": jsonl_content
+            }
+        },
     }
+
+    headers = {
+        "Authorization": f"Bearer {GIST_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+    }
+
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(
+            "https://api.github.com/gists",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+
         response.raise_for_status()
+
         gist_data = response.json()
-        filename = list(gist_data["files"].keys())[0]
-        return gist_data["files"][filename]["raw_url"]
+
+        raw_url = gist_data["files"][filename]["raw_url"]
+
+        return raw_url
+
     except Exception as e:
-        logger.error(f"Failed to upload gist: {e}")
-        return "https://example.com/log-failed.jsonl"
+        logger.exception("Failed to upload Gist: %s", e)
+        return ""
 
-# 4. Telegram Handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Data Analyst Bot is ready. Send me a data analysis question!")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.message.from_user.id)
-    user_text = update.message.text
-    run_id = str(uuid.uuid4())
-    run_log = [{"step": "start", "run_id": run_id, "user_input": user_text}]
+# ---------------------------------------------------------
+# 6. JSON extraction
+# ---------------------------------------------------------
 
+def extract_json(reply_text: str) -> dict:
+    """
+    Convert the model's response into a JSON object.
+    """
+
+    cleaned = reply_text.strip()
+
+    # Remove markdown fences if the model accidentally adds them.
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```json", "", 1)
+        cleaned = cleaned.replace("```", "", 1)
+        cleaned = cleaned.strip()
+
+    # First attempt: entire response is JSON.
     try:
-        llm = ChatOpenAI(model=LLM_MODEL, api_key=LLM_API_KEY, base_url=LLM_BASE_URL, temperature=0.0)
-        system_prompt = """You are an expert Data Analyst. Analyze the data provided and answer the question.
-        CRITICAL: Your final output MUST be a valid JSON object with exactly two keys: "answer" and "log_url".
-        The "answer" value must match the exact shape requested. Do NOT output markdown formatting.
-        Example: {"answer": {"state": "Assam"}, "log_url": "https://..."}"""
-        
-        agent = create_react_agent(llm, tools, prompt=system_prompt)
-        if user_id not in chat_histories:
-            chat_histories[user_id] = []
-        
-        messages = chat_histories[user_id][-4:] + [HumanMessage(content=user_text)]
-        logger.info(f"Running agent for user {user_id}")
-        run_log.append({"step": "agent_start", "model": LLM_MODEL})
-        
-        result = await agent.ainvoke({"messages": messages})
-        final_message = result["messages"][-1]
-        raw_output = final_message.content if hasattr(final_message, 'content') else str(final_message)
-        run_log.append({"step": "agent_result", "output": raw_output})
+        parsed = json.loads(cleaned)
 
-        chat_histories[user_id].append(HumanMessage(content=user_text))
-        chat_histories[user_id].append(AIMessage(content=raw_output))
+        if isinstance(parsed, dict):
+            return parsed
 
-        cleaned_output = raw_output.replace("```json", "").replace("```", "").strip()
+    except json.JSONDecodeError:
+        pass
+
+    # Second attempt: extract the outermost JSON object.
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+
+    if start != -1 and end != -1 and end > start:
+        candidate = cleaned[start:end + 1]
+
         try:
-            final_json = json.loads(cleaned_output)
-            if "answer" not in final_json:
-                final_json = {"answer": final_json}
+            parsed = json.loads(candidate)
+
+            if isinstance(parsed, dict):
+                return parsed
+
         except json.JSONDecodeError:
-            final_json = {"answer": {"text": cleaned_output}}
+            pass
 
-        final_json["log_url"] = upload_log_to_gist(run_id, run_log)
-        await update.message.reply_text(json.dumps(final_json))
+    raise ValueError("Model did not return valid JSON")
 
-    except Exception as e:
-        logger.error(f"Error processing message: {e}")
-        run_log.append({"step": "error", "message": str(e)})
-        error_response = json.dumps({"answer": {"error": "Failed to process."}, "log_url": upload_log_to_gist(run_id, run_log)})
-        await update.message.reply_text(error_response)
 
-# 5. Main Execution
-def main():
-    if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN not found in .env")
+# ---------------------------------------------------------
+# 7. /start
+# ---------------------------------------------------------
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "Data Analyst Bot is ready. Send me a question!"
+    )
+
+
+# ---------------------------------------------------------
+# 8. Main message handler
+# ---------------------------------------------------------
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not update.message or not update.message.text:
         return
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    chat_id = update.effective_chat.id
+    user_text = update.message.text
 
-    logger.info("Bot is starting and polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    run_id = str(uuid.uuid4())
+
+    run_log = [
+        {
+            "type": "incoming",
+            "timestamp": time.time(),
+            "run_id": run_id,
+            "chat_id": chat_id,
+            "text": user_text,
+        }
+    ]
+
+    try:
+
+        # ---------------------------------------------
+        # Conversation history
+        # ---------------------------------------------
+
+        history = conversation_history.setdefault(
+            chat_id,
+            []
+        )
+
+        history.append(
+            {
+                "role": "user",
+                "content": user_text,
+            }
+        )
+
+        # Keep only recent messages.
+        messages = history[-6:]
+
+        # ---------------------------------------------
+        # System prompt based on evaluator's solver
+        # ---------------------------------------------
+
+        system_prompt = """
+You are a careful data analyst.
+
+The user's LAST message asks a data-analysis question and
+tells you exactly what JSON shape to reply with.
+
+Your job is to work out the REAL answer.
+
+Use reliable information available to you, including:
+- MOSPI statistics when the question refers to MOSPI
+- public statistical knowledge
+- general knowledge
+- arithmetic or calculations when required
+- information contained in the conversation
+
+IMPORTANT RULES:
+
+1. Do NOT simply copy the JSON template from the user's question.
+
+2. The empty values in the user's requested JSON are placeholders.
+   You must replace them with the actual answer.
+
+3. Determine the answer before producing the final response.
+
+4. Follow the exact JSON structure requested by the user.
+
+5. Reply with ONLY valid JSON.
+
+6. Do NOT include markdown.
+
+7. Do NOT include ```json fences.
+
+8. Do NOT include explanations outside the JSON object.
+
+9. The final response must contain exactly these two
+   top-level keys:
+
+   "answer"
+   "log_url"
+
+10. Do not invent a value when the answer can be determined
+    from the available information.
+
+Example:
+
+If the user asks:
+
+Which state has the highest maternal mortality rate based on
+MOSPI data? Reply with ONLY this JSON object:
+{"answer":{"state":""},"log_url":""}
+
+and the correct answer is Assam, return:
+
+{"answer":{"state":"Assam"},"log_url":""}
+""".strip()
+
+        run_log.append(
+            {
+                "type": "agent_start",
+                "timestamp": time.time(),
+                "model": AIPIPE_MODEL,
+            }
+        )
+
+        # ---------------------------------------------
+        # Call AI Pipe
+        # ---------------------------------------------
+
+        response = client.chat.completions.create(
+            model=AIPIPE_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                }
+            ] + messages,
+            temperature=0,
+        )
+
+        reply_text = response.choices[0].message.content.strip()
+
+        run_log.append(
+            {
+                "type": "agent_output",
+                "timestamp": time.time(),
+                "output": reply_text,
+            }
+        )
+
+        logger.info(
+            "Model response for run %s: %s",
+            run_id,
+            reply_text,
+        )
+
+        # ---------------------------------------------
+        # Save assistant response to history
+        # ---------------------------------------------
+
+        history.append(
+            {
+                "role": "assistant",
+                "content": reply_text,
+            }
+        )
+
+        # ---------------------------------------------
+        # Parse JSON
+        # ---------------------------------------------
+
+        parsed = extract_json(reply_text)
+
+        # Ensure answer exists.
+        if "answer" not in parsed:
+            parsed = {
+                "answer": parsed
+            }
+
+        # ---------------------------------------------
+        # Upload log
+        # ---------------------------------------------
+
+        log_url = upload_log_to_gist(
+            run_id,
+            run_log,
+        )
+
+        # ---------------------------------------------
+        # Force log_url to our actual run log
+        # ---------------------------------------------
+
+        parsed["log_url"] = log_url
+
+        final_reply = json.dumps(
+            parsed,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        run_log.append(
+            {
+                "type": "outgoing",
+                "timestamp": time.time(),
+                "text": final_reply,
+            }
+        )
+
+        # Note:
+        # The outgoing event is added after the first Gist upload.
+        # Re-upload so the final log also contains the outgoing event.
+        log_url = upload_log_to_gist(
+            run_id,
+            run_log,
+        )
+
+        parsed["log_url"] = log_url
+
+        final_reply = json.dumps(
+            parsed,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        await update.message.reply_text(final_reply)
+
+        logger.info(
+            "Run %s completed successfully",
+            run_id,
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Error processing run %s",
+            run_id,
+        )
+
+        run_log.append(
+            {
+                "type": "error",
+                "timestamp": time.time(),
+                "message": str(e),
+            }
+        )
+
+        log_url = upload_log_to_gist(
+            run_id,
+            run_log,
+        )
+
+        error_response = {
+            "answer": {
+                "error": "Failed to process request"
+            },
+            "log_url": log_url,
+        }
+
+        await update.message.reply_text(
+            json.dumps(
+                error_response,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
+
+# ---------------------------------------------------------
+# 9. Main
+# ---------------------------------------------------------
+
+def main():
+
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error(
+            "TELEGRAM_BOT_TOKEN is missing from .env"
+        )
+        return
+
+    if not AIPIPE_TOKEN:
+        logger.error(
+            "LLM_API_KEY is missing from .env"
+        )
+        return
+
+    logger.info("Bot is starting...")
+
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message,
+        )
+    )
+
+    logger.info(
+        "Bot is running and polling..."
+    )
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
 
 if __name__ == "__main__":
     main()
-
-
-@tool
-def fetch_url_content(url: str) -> str:
-    """Fetch and return the text content from a URL."""
-    try:
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        return response.text[:8000]
-    except Exception as e:
-        return f"Error fetching URL: {str(e)}"
-
-
-@tool
-def python_data_analysis(code: str) -> str:
-    """Execute Python data-analysis code and return the captured output."""
-    try:
-        safe_globals = {
-            "__builtins__": __builtins__,
-            "pd": __import__("pandas"),
-            "io": __import__("io")
-        }
-        import io, sys
-        old_stdout = sys.stdout
-        sys.stdout = captured_output = io.StringIO()
-        exec(code, safe_globals)
-        sys.stdout = old_stdout
-        return captured_output.getvalue().strip()
-    except Exception as e:
-        return f"Execution Error: {str(e)}"    
