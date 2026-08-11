@@ -1,10 +1,13 @@
+
 import os
 import json
 import time
 import uuid
 import logging
-import requests
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 from telegram import Update
@@ -23,13 +26,23 @@ from telegram.ext import (
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
 AIPIPE_TOKEN = os.getenv("LLM_API_KEY", "").strip()
+
 AIPIPE_BASE_URL = os.getenv(
     "LLM_BASE_URL",
     "https://aipipe.org/openai/v1"
 )
-AIPIPE_MODEL = os.getenv("LLM_MODEL", "gpt-5-mini")
+
+AIPIPE_MODEL = os.getenv(
+    "LLM_MODEL",
+    "gpt-5-mini"
+)
+
 GIST_TOKEN = os.getenv("GITHUB_GIST_TOKEN")
+
+# Render provides the PORT environment variable.
+PORT = int(os.getenv("PORT", "10000"))
 
 # ---------------------------------------------------------
 # 2. Logging
@@ -58,20 +71,70 @@ client = OpenAI(
 conversation_history = {}
 
 # ---------------------------------------------------------
-# 5. Gist logging
+# 5. Render HTTP health server
 # ---------------------------------------------------------
 
-def upload_log_to_gist(run_id: str, log_entries: list) -> str:
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "application/json"
+        )
+        self.end_headers()
+
+        response = {
+            "status": "ok",
+            "service": "tds-p1-data-bot"
+        }
+
+        self.wfile.write(
+            json.dumps(response).encode("utf-8")
+        )
+
+    def log_message(self, format, *args):
+        # Disable default HTTP access logs.
+        pass
+
+
+def run_health_server():
+    server = HTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
+    )
+
+    logger.info(
+        "Health server listening on port %s",
+        PORT
+    )
+
+    server.serve_forever()
+
+
+# ---------------------------------------------------------
+# 6. Gist logging
+# ---------------------------------------------------------
+
+def upload_log_to_gist(
+    run_id: str,
+    log_entries: list
+) -> str:
     """
     Upload one run's JSONL log to a public GitHub Gist.
     """
 
     if not GIST_TOKEN:
-        logger.error("GITHUB_GIST_TOKEN is not configured")
+        logger.error(
+            "GITHUB_GIST_TOKEN is not configured"
+        )
         return ""
 
     jsonl_content = "\n".join(
-        json.dumps(entry, ensure_ascii=False)
+        json.dumps(
+            entry,
+            ensure_ascii=False
+        )
         for entry in log_entries
     )
 
@@ -110,12 +173,15 @@ def upload_log_to_gist(run_id: str, log_entries: list) -> str:
         return raw_url
 
     except Exception as e:
-        logger.exception("Failed to upload Gist: %s", e)
+        logger.exception(
+            "Failed to upload Gist: %s",
+            e
+        )
         return ""
 
 
 # ---------------------------------------------------------
-# 6. JSON extraction
+# 7. JSON extraction
 # ---------------------------------------------------------
 
 def extract_json(reply_text: str) -> dict:
@@ -127,8 +193,18 @@ def extract_json(reply_text: str) -> dict:
 
     # Remove markdown fences if the model accidentally adds them.
     if cleaned.startswith("```"):
-        cleaned = cleaned.replace("```json", "", 1)
-        cleaned = cleaned.replace("```", "", 1)
+        cleaned = cleaned.replace(
+            "```json",
+            "",
+            1
+        )
+
+        cleaned = cleaned.replace(
+            "```",
+            "",
+            1
+        )
+
         cleaned = cleaned.strip()
 
     # First attempt: entire response is JSON.
@@ -146,7 +222,10 @@ def extract_json(reply_text: str) -> dict:
     end = cleaned.rfind("}")
 
     if start != -1 and end != -1 and end > start:
-        candidate = cleaned[start:end + 1]
+
+        candidate = cleaned[
+            start:end + 1
+        ]
 
         try:
             parsed = json.loads(candidate)
@@ -157,24 +236,27 @@ def extract_json(reply_text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    raise ValueError("Model did not return valid JSON")
+    raise ValueError(
+        "Model did not return valid JSON"
+    )
 
 
 # ---------------------------------------------------------
-# 7. /start
+# 8. /start
 # ---------------------------------------------------------
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     await update.message.reply_text(
         "Data Analyst Bot is ready. Send me a question!"
     )
 
 
 # ---------------------------------------------------------
-# 8. Main message handler
+# 9. Main message handler
 # ---------------------------------------------------------
 
 async def handle_message(
@@ -222,7 +304,7 @@ async def handle_message(
         messages = history[-6:]
 
         # ---------------------------------------------
-        # System prompt based on evaluator's solver
+        # System prompt
         # ---------------------------------------------
 
         system_prompt = """
@@ -234,6 +316,7 @@ tells you exactly what JSON shape to reply with.
 Your job is to work out the REAL answer.
 
 Use reliable information available to you, including:
+
 - MOSPI statistics when the question refers to MOSPI
 - public statistical knowledge
 - general knowledge
@@ -304,7 +387,11 @@ and the correct answer is Assam, return:
             temperature=0,
         )
 
-        reply_text = response.choices[0].message.content.strip()
+        reply_text = (
+            response.choices[0]
+            .message.content
+            .strip()
+        )
 
         run_log.append(
             {
@@ -353,7 +440,7 @@ and the correct answer is Assam, return:
         )
 
         # ---------------------------------------------
-        # Force log_url to our actual run log
+        # Set log_url
         # ---------------------------------------------
 
         parsed["log_url"] = log_url
@@ -372,9 +459,8 @@ and the correct answer is Assam, return:
             }
         )
 
-        # Note:
-        # The outgoing event is added after the first Gist upload.
-        # Re-upload so the final log also contains the outgoing event.
+        # Re-upload so the final log contains
+        # the outgoing event.
         log_url = upload_log_to_gist(
             run_id,
             run_log,
@@ -388,7 +474,9 @@ and the correct answer is Assam, return:
             separators=(",", ":"),
         )
 
-        await update.message.reply_text(final_reply)
+        await update.message.reply_text(
+            final_reply
+        )
 
         logger.info(
             "Run %s completed successfully",
@@ -432,24 +520,39 @@ and the correct answer is Assam, return:
 
 
 # ---------------------------------------------------------
-# 9. Main
+# 10. Main
 # ---------------------------------------------------------
 
 def main():
 
     if not TELEGRAM_BOT_TOKEN:
         logger.error(
-            "TELEGRAM_BOT_TOKEN is missing from .env"
+            "TELEGRAM_BOT_TOKEN is missing"
         )
         return
 
     if not AIPIPE_TOKEN:
         logger.error(
-            "LLM_API_KEY is missing from .env"
+            "LLM_API_KEY is missing"
         )
         return
 
     logger.info("Bot is starting...")
+
+    # -----------------------------------------------------
+    # Start HTTP server for Render
+    # -----------------------------------------------------
+
+    health_thread = threading.Thread(
+        target=run_health_server,
+        daemon=True,
+    )
+
+    health_thread.start()
+
+    # -----------------------------------------------------
+    # Telegram application
+    # -----------------------------------------------------
 
     app = (
         ApplicationBuilder()
@@ -458,13 +561,16 @@ def main():
     )
 
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            handle_message,
+            handle_message
         )
     )
 
@@ -477,5 +583,9 @@ def main():
     )
 
 
+# ---------------------------------------------------------
+# 11. Entry point
+# ---------------------------------------------------------
+
 if __name__ == "__main__":
-    main()  
+    main()
