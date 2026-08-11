@@ -136,3 +136,33 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+@tool
+def fetch_url_content(url: str) -> str:
+    """Fetch and return the text content from a URL."""
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        return response.text[:8000]
+    except Exception as e:
+        return f"Error fetching URL: {str(e)}"
+
+
+@tool
+def python_data_analysis(code: str) -> str:
+    """Execute Python data-analysis code and return the captured output."""
+    try:
+        safe_globals = {
+            "__builtins__": __builtins__,
+            "pd": __import__("pandas"),
+            "io": __import__("io")
+        }
+        import io, sys
+        old_stdout = sys.stdout
+        sys.stdout = captured_output = io.StringIO()
+        exec(code, safe_globals)
+        sys.stdout = old_stdout
+        return captured_output.getvalue().strip()
+    except Exception as e:
+        return f"Execution Error: {str(e)}"    
