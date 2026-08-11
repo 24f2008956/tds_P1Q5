@@ -23,7 +23,7 @@ from telegram.ext import (
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-AIPIPE_TOKEN = os.getenv("LLM_API_KEY")
+AIPIPE_TOKEN = os.getenv("LLM_API_KEY", "").strip()
 AIPIPE_BASE_URL = os.getenv(
     "LLM_BASE_URL",
     "https://aipipe.org/openai/v1"
@@ -478,4 +478,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()  
